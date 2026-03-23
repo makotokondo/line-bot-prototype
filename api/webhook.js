@@ -55,6 +55,130 @@ const MY_PROFILE = `
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const KV_REST_API_URL = process.env.KV_REST_API_URL;
+const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN;
+
+const HISTORY_TURNS = 6;
+const HISTORY_MESSAGES = HISTORY_TURNS * 2;
+const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 14;
+
+// KV未設定時の簡易フォールバック（サーバレスでは永続しない）
+const runtimeHistoryStore = new Map();
+
+function isKvEnabled() {
+  return Boolean(KV_REST_API_URL && KV_REST_API_TOKEN);
+}
+
+async function runKvCommand(...parts) {
+  const res = await fetch(KV_REST_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${KV_REST_API_TOKEN}`,
+    },
+    body: JSON.stringify(parts.map((p) => String(p))),
+  });
+
+  if (!res.ok) {
+    throw new Error(`KV command failed: ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.result;
+}
+
+function getConversationKey(source) {
+  if (!source || !source.type) {
+    return "line:unknown";
+  }
+
+  if (source.type === "user") {
+    return `line:user:${source.userId || "unknown"}`;
+  }
+
+  if (source.type === "group") {
+    return `line:group:${source.groupId || "unknown"}`;
+  }
+
+  if (source.type === "room") {
+    return `line:room:${source.roomId || "unknown"}`;
+  }
+
+  return `line:${source.type}:unknown`;
+}
+
+async function loadConversationHistory(conversationKey) {
+  if (isKvEnabled()) {
+    try {
+      const rows = await runKvCommand(
+        "lrange",
+        conversationKey,
+        `-${HISTORY_MESSAGES}`,
+        "-1"
+      );
+      if (!Array.isArray(rows)) {
+        return [];
+      }
+
+      return rows
+        .map((item) => {
+          try {
+            return JSON.parse(item);
+          } catch {
+            return null;
+          }
+        })
+        .filter((item) => item && item.role && item.content);
+    } catch (err) {
+      console.error("Failed to load history from KV:", err);
+      return [];
+    }
+  }
+
+  const rows = runtimeHistoryStore.get(conversationKey) || [];
+  return rows.slice(-HISTORY_MESSAGES);
+}
+
+async function saveConversationHistory(
+  conversationKey,
+  userMessage,
+  assistantMessage,
+  userName
+) {
+  const userEntry = {
+    role: "user",
+    content: `${userName}さんからのメッセージ: 「${userMessage}」`,
+  };
+  const assistantEntry = {
+    role: "assistant",
+    content: assistantMessage,
+  };
+
+  if (isKvEnabled()) {
+    try {
+      await runKvCommand(
+        "rpush",
+        conversationKey,
+        JSON.stringify(userEntry),
+        JSON.stringify(assistantEntry)
+      );
+      await runKvCommand(
+        "ltrim",
+        conversationKey,
+        `-${HISTORY_MESSAGES}`,
+        "-1"
+      );
+      await runKvCommand("expire", conversationKey, HISTORY_TTL_SECONDS);
+      return;
+    } catch (err) {
+      console.error("Failed to save history to KV:", err);
+    }
+  }
+
+  const rows = runtimeHistoryStore.get(conversationKey) || [];
+  rows.push(userEntry, assistantEntry);
+  runtimeHistoryStore.set(conversationKey, rows.slice(-HISTORY_MESSAGES));
+}
 
 // ---- 署名検証 --------------------------------------------------------
 function verifySignature(body, signature) {
@@ -66,7 +190,15 @@ function verifySignature(body, signature) {
 }
 
 // ---- Claude API 呼び出し ---------------------------------------------
-async function askClaude(userMessage, userName) {
+async function askClaude(userMessage, userName, historyMessages = []) {
+  const messages = [
+    ...historyMessages,
+    {
+      role: "user",
+      content: `${userName}さんからのメッセージ: 「${userMessage}」`,
+    },
+  ];
+
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -78,12 +210,7 @@ async function askClaude(userMessage, userName) {
       model: "claude-sonnet-4-20250514",
       max_tokens: 300,
       system: MY_PROFILE,
-      messages: [
-        {
-          role: "user",
-          content: `${userName}さんからのメッセージ: 「${userMessage}」`,
-        },
-      ],
+      messages,
     }),
   });
 
@@ -146,13 +273,21 @@ export default async function handler(req, res) {
     const userName =
       event.source.type === "user" ? "友人" : "グループメンバー";
     const replyToken = event.replyToken;
+    const conversationKey = getConversationKey(event.source);
 
     console.log(`📩 ${userName}: ${userMessage}`);
 
     try {
-      const reply = await askClaude(userMessage, userName);
+      const historyMessages = await loadConversationHistory(conversationKey);
+      const reply = await askClaude(userMessage, userName, historyMessages);
       console.log(`🤖 Reply: ${reply}`);
       await replyToLine(replyToken, reply);
+      await saveConversationHistory(
+        conversationKey,
+        userMessage,
+        reply,
+        userName
+      );
     } catch (err) {
       console.error("Error processing message:", err);
       await replyToLine(
