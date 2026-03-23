@@ -34,6 +34,9 @@ const MY_PROFILE = `
 - 必要なら具体的な行動提案を1つだけ出す
 - 曖昧な予定は「確認してまた連絡する」と伝える
 - 心配が強い話題（体調悪化・通院・お金の不安）は、短く気にかけつつ本人確認を促す
+- 3回に1回くらいの頻度で、短い質問返しを入れて相手の返事を待つ
+- 返信は通常1通。必要なときだけ2通に分けてよい
+- 2通に分ける場合は、1つのテキスト内で "<SPLIT>" を1回だけ使って区切る
 
 ## よく聞かれること（FAQ）
 - 「いつ来るの？」→ はっきり決まっていなければ「日程を確認してまた連絡するね」と返す
@@ -61,6 +64,7 @@ const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN;
 const HISTORY_TURNS = 6;
 const HISTORY_MESSAGES = HISTORY_TURNS * 2;
 const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 14;
+const RESPONSE_SPLIT_TOKEN = "<SPLIT>";
 
 // KV未設定時の簡易フォールバック（サーバレスでは永続しない）
 const runtimeHistoryStore = new Map();
@@ -223,8 +227,28 @@ async function askClaude(userMessage, userName, historyMessages = []) {
   return data.content?.[0]?.text || "うまく返信できなかった…本人に聞いてみて！";
 }
 
+function toLineMessages(replyText) {
+  const parts = String(replyText)
+    .split(RESPONSE_SPLIT_TOKEN)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, 2);
+
+  const safeParts =
+    parts.length > 0 ? parts : ["うまく返信できなかった…本人に聞いてみて！"];
+  return safeParts.map((text) => ({ type: "text", text }));
+}
+
+function normalizeReplyForHistory(replyText) {
+  return String(replyText)
+    .split(RESPONSE_SPLIT_TOKEN)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 // ---- LINE 返信 -------------------------------------------------------
-async function replyToLine(replyToken, text) {
+async function replyToLine(replyToken, messages) {
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
@@ -233,7 +257,7 @@ async function replyToLine(replyToken, text) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text }],
+      messages,
     }),
   });
 }
@@ -281,18 +305,24 @@ export default async function handler(req, res) {
       const historyMessages = await loadConversationHistory(conversationKey);
       const reply = await askClaude(userMessage, userName, historyMessages);
       console.log(`🤖 Reply: ${reply}`);
-      await replyToLine(replyToken, reply);
+      const lineMessages = toLineMessages(reply);
+      await replyToLine(replyToken, lineMessages);
       await saveConversationHistory(
         conversationKey,
         userMessage,
-        reply,
+        normalizeReplyForHistory(reply),
         userName
       );
     } catch (err) {
       console.error("Error processing message:", err);
       await replyToLine(
         replyToken,
-        "ごめん、今ちょっと調子悪いみたい。あとで本人から連絡するね！"
+        [
+          {
+            type: "text",
+            text: "ごめん、今ちょっと調子悪いみたい。あとで本人から連絡するね！",
+          },
+        ]
       );
     }
   }
